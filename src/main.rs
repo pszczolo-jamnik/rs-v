@@ -93,6 +93,10 @@ struct IllegalInstruction;
 
 #[derive(Debug)]
 enum Csr {
+    MIsa,
+    MVendorId,
+    MArchId,
+    MImpId,
     MHartId,
     MStatus,
     MIe,
@@ -101,14 +105,37 @@ enum Csr {
     MEpc,
     MCause,
     MTVal,
-    MIp
+    MIp,
+    MConfigPtr,
+}
+
+
+enum Cause {
+    InstructionAddressMisaligned,
+    InstructionAccessFault,
+    IllegalInstruction,
+    Breakpoint,
+    LoadAddressMisaligned,
+    LoadAccessFault,
+    StoreAmoAddressMisaligned,
+    StoreAmoAccessFault,
+    // Ucall,
+    // Scall,
+    Mcall,
+    SoftwareCheck,
+    HardwareError,
 }
 
 impl Csr {
     fn get_csr(address: u16) -> Option<Self> {
         match address {
+            0xF11 => Some(Self::MVendorId),
+            0xF12 => Some(Self::MArchId),
+            0xF13 => Some(Self::MImpId),
             0xF14 => Some(Self::MHartId),
+            0xF15 => Some(Self::MConfigPtr),
             0x300 => Some(Self::MStatus),
+            0x301 => Some(Self::MIsa),
             0x304 => Some(Self::MIe),
             0x305 => Some(Self::MTvec),
             0x340 => Some(Self::MScratch),
@@ -127,11 +154,19 @@ struct CoreState {
     pc: u32,
     regs: [u32; 32],
     memory: [u8; MEMORY_SIZE],
+    // M-mode
+    mie: bool,
+    mpie: bool,
+    mtvec: u32,
+    mscratch: u32,
+    mepc: u32,
+    mcause: Cause,
+    mtval: u32,
 }
 
 impl Display for CoreState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "pc: 0x{:08x}", self.pc)?;
+        write!(f, "pc: 0x{:08x}", self.pc)?;
         // for (i, reg) in self.regs.iter().enumerate() {
         //     let new_line = {if i % 4 == 3 {'\n'} else {' '}};
         //     write!(f, "{:>5}: 0x{:08x}{}", Self::reg_name(i), reg, new_line)?;
@@ -157,6 +192,65 @@ impl CoreState {
             18..=27 => format!("s{}", index - 16),
             28..=31 => format!("t{}", index - 25),
             _ => unimplemented!(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pc = 0;
+        self.mie = false;
+        self.mpie = false;
+    }
+
+    fn get_csr_value(&self, csr: &Csr) -> u32 {
+        match csr {
+            // RV32IM
+            Csr::MIsa => (1 << 30) | (1 << 8) | (1 << 12),
+            Csr::MVendorId => 0,
+            Csr::MArchId => 0,
+            Csr::MImpId => 0,
+            Csr::MHartId => 0,
+            Csr::MStatus => (3 << 11) |
+                            ((self.mie as u32) << 3) |
+                            ((self.mpie as u32) << 7),
+            Csr::MIe => 0,
+            Csr::MTvec => self.mtvec,
+            Csr::MScratch => self.mscratch,
+            Csr::MEpc => self.mepc,
+            Csr::MCause => Self::get_cause_value(&self.mcause),
+            Csr::MTVal => self.mtval,
+            Csr::MIp => 0,
+            Csr::MConfigPtr => 0,
+        }
+    }
+
+    fn set_csr_value(&mut self, csr: &Csr, value: u32) {
+        match csr {
+            Csr::MStatus => {
+                self.mie = (value >> 3) & 1 != 0;
+                self.mpie = (value >> 7) & 1 != 0;
+            }
+            Csr::MTvec => self.mtvec = value,
+            Csr::MScratch => self.mscratch = value,
+            Csr::MEpc => self.mepc = value,
+            // Csr::MCause => Self::get_cause_value(&self.mcause),
+            Csr::MTVal => self.mtval = value,
+            _ => {},
+        }
+    }
+
+    fn get_cause_value(cause: &Cause) -> u32 {
+        match cause {
+            Cause::InstructionAddressMisaligned => 0,
+            Cause::InstructionAccessFault => 1,
+            Cause::IllegalInstruction => 2,
+            Cause::Breakpoint => 3,
+            Cause::LoadAddressMisaligned => 4,
+            Cause::LoadAccessFault => 5,
+            Cause::StoreAmoAddressMisaligned => 6,
+            Cause::StoreAmoAccessFault => 7,
+            Cause::Mcall => 11,
+            Cause::SoftwareCheck => 18,
+            Cause::HardwareError => 19,
         }
     }
 
@@ -293,6 +387,7 @@ impl CoreState {
     /// TODO: Refactor branch load store sections
     ///
     /// TODO: Fix rs/rd races
+    ///
     fn execute(&mut self) {
         let address = (self.pc as usize)..=((self.pc + 3) as usize);
         let instruction = u32::from_le_bytes(self.memory[address].try_into().expect("fetch error"));
@@ -311,6 +406,8 @@ impl CoreState {
                 Instruction::Bgeu(_) => true,
                 _ => false
             };
+
+            let mut exception = false;
 
             match instr {
                 Instruction::Lui(args) => {
@@ -463,34 +560,57 @@ impl CoreState {
                 Instruction::And(args) => {
                     self.regs[args.rd] = self.regs[args.rs1] & self.regs[args.rs2];
                 }
-                Instruction::Fence => todo!(),
+                Instruction::Fence => {}
                 Instruction::FenceTso => todo!(),
                 Instruction::Pause => todo!(),
-                Instruction::Ecall => todo!(),
-                Instruction::Ebreak => todo!(),
+                Instruction::Ecall => {
+                    exception = true;
+                    self.mepc = self.pc;
+                    self.mcause = Cause::Mcall;
+                }
+                Instruction::Ebreak => {
+                    exception = true;
+                    self.mepc = self.pc;
+                    self.mcause = Cause::Breakpoint;
+                }
                 Instruction::Mret => todo!(),
                 Instruction::Wfi => todo!(),
                 Instruction::Csrrw(args) => {
-                    println!("{:?}", Csr::get_csr(args.csr));
+                    if let Some(csr) = Csr::get_csr(args.csr) {
+                        let rs1 = self.regs[args.rs1];
+                        self.regs[args.rd] = self.get_csr_value(&csr);
+                        self.set_csr_value(&csr, rs1);
+                    } else {
+                        exception = true;
+                        self.mepc = self.pc;
+                        self.mcause = Cause::IllegalInstruction;
+                    }
                 }
                 Instruction::Csrrs(args) => {
-                    println!("{:?}", Csr::get_csr(args.csr));
+                    // println!("{:?}", Csr::get_csr(args.csr));
                 }
                 Instruction::Csrrc(args) => {
-                    println!("{:?}", Csr::get_csr(args.csr));
+                    // println!("{:?}", Csr::get_csr(args.csr));
                 }
                 Instruction::Csrrwi(args) => {
-                    println!("{:?}", Csr::get_csr(args.csr));
+                    // println!("{:?}", Csr::get_csr(args.csr));
                 }
                 Instruction::Csrrsi(args) => {
-                    println!("{:?}", Csr::get_csr(args.csr));
+                    // println!("{:?}", Csr::get_csr(args.csr));
                 }
                 Instruction::Csrrci(args) => {
-                    println!("{:?}", Csr::get_csr(args.csr));
+                    // println!("{:?}", Csr::get_csr(args.csr));
                 }
             }
-            if !jump_branch {
-                self.pc += 4;
+            match (jump_branch, exception) {
+                (_, true) => {
+                    self.pc = self.mtvec;
+                    println!("😱 it's a trap!");
+                    // remove!
+                    todo!();
+                }
+                (false, false) => self.pc += 4,
+                (_, _) => {},
             }
             self.regs[0] = 0;
         } else {
@@ -499,38 +619,80 @@ impl CoreState {
     }
 }
 
+fn get_tests(path: &str, filter: &str) -> Vec<String> {
+    let dir = fs::read_dir(path).unwrap();
+    dir
+        .map(|entry| String::from(entry.unwrap().path().to_str().unwrap()))
+        .filter(|entry| entry.contains(filter) && !entry.ends_with("dump"))
+        .collect()
+
+}
 
 
 fn main() -> std::io::Result<()> {
-
     let mut core_state = CoreState {
         pc: 0x0000_0000,
         regs: [0; 32],
         memory: [0; MEMORY_SIZE],
+        mie: false,
+        mpie: false,
+        mtvec: 0,
+        mscratch: 0,
+        mepc: 0,
+        mcause: Cause::HardwareError,
+        mtval: 0,
     };
 
-    let file_contents = fs::read("./rs-v-target")
-                                    .expect("file read error");
-    let elf = ElfBytes::<AnyEndian>::minimal_parse(&file_contents)
-                                            .expect("elf parse error");
-    let sections = elf.section_headers().expect("elf parse error");
+    let tests = get_tests("riscv-tests-elf", "rv32ui");
 
-    for section in sections {
-        if (abi::SHF_EXECINSTR as u64) & section.sh_flags != 0 {
-            let text = elf.section_data(&section).expect("elf parse error").0;
-            core_state.memory[..text.len()].copy_from_slice(text);
+    for test in tests {
+
+        let file_contents = fs::read(&test)
+                                        .expect("file read error");
+        let elf = ElfBytes::<AnyEndian>::minimal_parse(&file_contents)
+                                                .expect("elf parse error");
+        let sections = elf.section_headers().expect("elf parse error");
+
+        for section in sections {
+            if (abi::SHF_EXECINSTR as u64) & section.sh_flags != 0 {
+                let text = elf.section_data(&section).expect("elf parse error").0;
+                core_state.memory[..text.len()].copy_from_slice(text);
+            }
+        }
+
+        let mut pass_pc: u32 = 0;
+        let mut fail_pc: u32 = 0;
+
+        let (sym_tab, str_tab) = elf.symbol_table().unwrap().unwrap();
+        for sym in sym_tab.iter() {
+            let name = str_tab.get(sym.st_name as usize).unwrap();
+            match name {
+                "pass" => pass_pc = sym.st_value as u32,
+                "fail" => fail_pc = sym.st_value as u32,
+                _ => {}
+            }
+        }
+        println!("{}", test);
+        println!("pass: 0x{:x} fail: 0x{:x}", pass_pc, fail_pc);
+
+        if (pass_pc == 0) || (fail_pc == 0) {
+            println!("🟡");
+            continue;
+        }
+
+        core_state.reset();
+
+        loop {
+            println!("{}", core_state);
+            core_state.execute();
+            match core_state.pc {
+                p if p == pass_pc => {println!("🟢"); break;},
+                f if f == fail_pc => {println!("🔴"); break;},
+                _ => {}
+            }
         }
     }
 
-    loop {
-        // println!("{:}", core_state);
-        core_state.execute();
-        if core_state.pc == 0x2b0 {break;}
-    }
-
-    // println!("path: {:?}", env::current_dir().unwrap());
-
-    // println!("{}", core_state);
 
     Ok(())
 }

@@ -1,0 +1,6 @@
+location: .
+sources:
+  - repo: https://github.com/riscv-software-src/riscv-tests.git
+    name: riscv-tests
+    rev: master
+    type: git
